@@ -14,7 +14,7 @@ from frame_proxy.domain.transitions import transition_contact_sheet
 from frame_proxy.media.avi import probe_avi
 from frame_proxy.media.contact import compose_grid, plan_grid
 from frame_proxy.media.frames import Frame, decode_frame_at
-from frame_proxy.media.ppm import validate_ppm
+from frame_proxy.media.ppm import validate_legacy_ppm, validate_ppm
 from frame_proxy.storage.repository import FileRepository
 
 
@@ -188,12 +188,33 @@ class ContactSheetService:
                 status=500,
                 details={"sheet_id": record.sheet_id},
             )
+        self._validate_ppm_format(record, payload)
+
+    def _validate_ppm_format(
+        self,
+        record: ContactSheetRecord,
+        payload: bytes,
+    ) -> None:
+        # Records produced before the format update carry neither the current
+        # revision nor the generated-verification marker. They keep their
+        # original, lenient reading semantics; current records stay strict.
+        legacy = (
+            record.format_revision < 2
+            or record.verification_source != "generated"
+        )
         try:
-            validate_ppm(
-                payload,
-                expected_width=record.image_width,
-                expected_height=record.image_height,
-            )
+            if legacy:
+                validate_legacy_ppm(
+                    payload,
+                    expected_width=record.image_width,
+                    expected_height=record.image_height,
+                )
+            else:
+                validate_ppm(
+                    payload,
+                    expected_width=record.image_width,
+                    expected_height=record.image_height,
+                )
         except ValueError as exc:
             raise ApplicationError(
                 ErrorCode.STORAGE,

@@ -42,19 +42,43 @@ def _read_header_token(data: bytes, cursor: int) -> tuple[bytes, int]:
     return data[start:cursor], cursor
 
 
-def _raster_offset(data: bytes, cursor: int) -> int:
+def _raster_candidates(data: bytes, cursor: int) -> list[int]:
+    """Return plausible raster starts after the maximum value token.
+
+    The canonical PPM form places exactly one separator between the maximum
+    value and the raster.  Older encoders may instead finish with a comment or
+    extra layout whitespace, so that lenient boundary is offered as a second
+    candidate.  The declared geometry decides which boundary is correct; a
+    ``#`` byte inside the raster itself must never be consumed as a comment.
+    """
     if cursor >= len(data) or data[cursor] not in b" \t\r\n":
         raise ValueError("PPM header is missing its final separator")
     if data[cursor : cursor + 2] == b"\r\n":
-        cursor += 2
+        canonical = cursor + 2
     else:
-        cursor += 1
+        canonical = cursor + 1
 
-    # Newer encoders may emit a comment between the maximum and raster.
-    # Reusing header layout parsing here also normalizes that representation.
-    if data[cursor : cursor + 1] == b"#":
-        cursor = _skip_header_layout(data, cursor)
-    return cursor
+    candidates = [canonical]
+    # The lenient scan only proposes a fallback boundary: it must never raise
+    # into the caller, because a '#' byte may belong to the raster itself.
+    try:
+        lenient = _skip_header_layout(data, cursor)
+    except ValueError:
+        lenient = None
+    if lenient is not None and lenient not in candidates:
+        candidates.append(lenient)
+    return candidates
+
+
+def _resolve_raster_offset(
+    data: bytes,
+    cursor: int,
+    expected_raster_size: int,
+) -> int:
+    for candidate in _raster_candidates(data, cursor):
+        if 0 <= candidate < len(data) and len(data) - candidate == expected_raster_size:
+            return candidate
+    raise ValueError("PPM payload length does not match its header")
 
 
 def encode_ppm(width: int, height: int, pixels: bytes) -> bytes:
@@ -80,12 +104,9 @@ def parse_ppm_header(data: bytes) -> PpmHeader:
         maximum = int(maximum_token)
     except ValueError as exc:
         raise ValueError("PPM header dimensions must be integers") from exc
-    cursor = _raster_offset(data, cursor)
-    expected = width * height * 3
     if width <= 0 or height <= 0 or maximum != 255:
         raise ValueError("PPM header values are out of range")
-    if len(data) - cursor != expected:
-        raise ValueError("PPM payload length does not match its header")
+    cursor = _resolve_raster_offset(data, cursor, width * height * 3)
     return PpmHeader(
         width=width,
         height=height,
@@ -105,6 +126,28 @@ def validate_ppm(
         raise ValueError("PPM width does not match the contact sheet record")
     if expected_height is not None and header.height != expected_height:
         raise ValueError("PPM height does not match the contact sheet record")
+    if len(data) - header.pixel_offset != header.pixel_byte_size:
+        raise ValueError("PPM raster length does not match its dimensions")
+    return header
+
+
+def validate_legacy_ppm(
+    data: bytes,
+    *,
+    expected_width: int,
+    expected_height: int,
+) -> PpmHeader:
+    """Validate artifacts published before the current format revision.
+
+    Legacy records carry no post-upgrade validation metadata, so they keep the
+    original reading semantics: accept header separator and comment variants
+    emitted by older encoders while still proving the exact raster geometry.
+    Truly truncated payloads or dimension mismatches cannot satisfy the exact
+    raster length check and remain rejected.
+    """
+    header = parse_ppm_header(data)
+    if header.width != expected_width or header.height != expected_height:
+        raise ValueError("PPM dimensions do not match the contact sheet record")
     if len(data) - header.pixel_offset != header.pixel_byte_size:
         raise ValueError("PPM raster length does not match its dimensions")
     return header
